@@ -6,7 +6,7 @@ Telegram bot that watches trending Solana meme coin pools and alerts when the
 5-minute volume of a pool jumps sharply compared with the previous 5-minute
 reading.
 
-* Free public APIs only (no keys): DexScreener + GeckoTerminal
+* Free public APIs only (no keys): DexScreener + GeckoTerminal + RugCheck
 * Runs on Android Termux, no VPS / website / database
 * Scans automatically every 5 minutes (configurable)
 * Previous readings, alert history and watchlist are saved in state.json,
@@ -18,6 +18,9 @@ Usage:
     python shadow_volume_alert.py --dry-run    # never send to Telegram, print alerts
     python shadow_volume_alert.py --test-telegram   # send one test message and exit
     python shadow_volume_alert.py --selftest   # offline logic test (no network)
+
+Telegram commands: /start /status /settings /last /pause /resume /help
+Alerts include a RugCheck safety check and buy/sell pressure.
 """
 
 import argparse
@@ -28,12 +31,13 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 
 import requests
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.env")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
@@ -42,6 +46,7 @@ LOG_FILE = os.path.join(BASE_DIR, "shadow_volume_alert.log")
 DEXSCREENER = "https://api.dexscreener.com"
 GECKOTERMINAL = "https://api.geckoterminal.com/api/v2"
 TELEGRAM = "https://api.telegram.org"
+RUGCHECK = "https://api.rugcheck.xyz/v1"
 GT_GAP = 6.5  # seconds between GeckoTerminal calls (free tier is strict)
 
 # Base tokens that are not meme coins (SOL, stablecoins, liquid staking, majors)
@@ -81,13 +86,16 @@ DEFAULTS = {
     "CROSS_CHECK_GECKOTERMINAL": "true",
     "CROSS_CHECK_TOLERANCE": "0.5",
     "SEND_STARTUP_MESSAGE": "true",
+    "SKIP_HIGH_RISK": "false",
+    "MIN_BUY_RATIO": "0",
     "EXCLUDE_SYMBOLS": ("SOL,WSOL,USDC,USDT,PYUSD,USD1,USDS,USDG,EURC,FDUSD,DAI,MSOL,JITOSOL,BSOL,JUPSOL,INF,"
                         "BTC,WBTC,CBBTC,ZBTC,TBTC,ETH,WETH,ZEC,XRP,BNB,SUI,HYPE,LINK,DOGE,LTC,ADA,AVAX,"
-                        "JUP,JTO,PYTH,RAY,ORCA,HNT,RENDER,W,DRIFT,KMNO,MET,TNSR,CLOUD,SAND,GOLD,XAUT,PAXG"),
+                        "JUP,JLP,JTO,PYTH,RAY,ORCA,HNT,RENDER,W,DRIFT,KMNO,MET,TNSR,CLOUD,SAND,GOLD,XAUT,PAXG"),
 }
 
 log = logging.getLogger("shadow")
 _running = True
+STATE_LOCK = threading.RLock()  # protects the state shared by the scan loop and the command thread
 
 
 # ----------------------------------------------------------------------------
@@ -142,6 +150,8 @@ def load_config(path=CONFIG_FILE):
         "cross_check": flag("CROSS_CHECK_GECKOTERMINAL"),
         "tolerance": num("CROSS_CHECK_TOLERANCE"),
         "startup_msg": flag("SEND_STARTUP_MESSAGE"),
+        "skip_high_risk": flag("SKIP_HIGH_RISK"),
+        "min_buy_ratio": max(0.0, num("MIN_BUY_RATIO")),
         "exclude_symbols": {x.strip().upper() for x in cfg["EXCLUDE_SYMBOLS"].split(",") if x.strip()},
     }
 
@@ -162,18 +172,19 @@ def setup_logging():
 
 
 def empty_state():
-    return {"readings": {}, "alerts": {}, "watch": {}}
+    return {"readings": {}, "alerts": {}, "watch": {}, "alert_log": [], "paused": False, "tg_offset": 0}
 
 
-def load_state(path=STATE_FILE):
+def load_state(path=None):
+    path = path or STATE_FILE
     if not os.path.exists(path):
         return empty_state()
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         state = empty_state()
-        for key in state:
-            if isinstance(data.get(key), dict):
+        for key, default in list(state.items()):
+            if isinstance(data.get(key), type(default)):
                 state[key] = data[key]
         return state
     except (OSError, ValueError) as exc:
@@ -187,13 +198,16 @@ def load_state(path=STATE_FILE):
         return empty_state()
 
 
-def save_state(state, path=STATE_FILE):
+def save_state(state, path=None):
     """Atomic write: write to a temp file then rename over the old one."""
+    path = path or STATE_FILE
     directory = os.path.dirname(path) or "."
+    with STATE_LOCK:
+        text = json.dumps(state, separators=(",", ":"))
     fd, tmp = tempfile.mkstemp(prefix=".state_", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, separators=(",", ":"))
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -386,6 +400,7 @@ def extract_metrics(pair):
         "sells": int(to_float(txns.get("sells"))),
         "price": pair.get("priceUsd"),
         "change5m": (pair.get("priceChange") or {}).get("m5"),
+        "change1h": (pair.get("priceChange") or {}).get("h1"),
         "mcap": to_float(pair.get("marketCap") or pair.get("fdv")),
         "created": pair.get("pairCreatedAt"),
         "url": pair.get("url") or "https://dexscreener.com/solana/%s" % pair.get("pairAddress", ""),
@@ -404,6 +419,8 @@ def evaluate(m, prev, cfg, now):
         return False, "5m volume %.0f < %.0f" % (m["vol5m"], cfg["min_volume"]), 0.0
     if txns < cfg["min_txns"]:
         return False, "5m txns %d < %d" % (txns, cfg["min_txns"]), 0.0
+    if cfg.get("min_buy_ratio", 0) > 0 and m["buys"] < cfg["min_buy_ratio"] * max(m["sells"], 1):
+        return False, "buy/sell ratio below %.2f" % cfg["min_buy_ratio"], 0.0
     if not prev:
         return False, "no previous reading yet (baseline)", 0.0
     gap = now - prev.get("ts", 0)
@@ -459,16 +476,20 @@ def fmt_price(price):
     return "$%.10f" % p if p < 0.0001 else "$%.6f" % p
 
 
-def build_alert(m, prev_vol, mult, gt_note):
+def fmt_pct(value):
+    return "%+.2f%%" % to_float(value) if value is not None else "n/a"
+
+
+def build_alert(m, prev_vol, mult, gt_note, safety=None):
     e = html.escape
     buys, sells = m["buys"], m["sells"]
     total = buys + sells
     buy_pct = (buys * 100.0 / total) if total else 0
+    ratio, pressure = buy_pressure(buys, sells)
     age = ""
     if m["created"]:
         hours = (time.time() * 1000 - to_float(m["created"])) / 3_600_000
         age = "%.1fh" % hours if hours < 48 else "%.0fd" % (hours / 24)
-    change = m["change5m"]
     lines = [
         "🚨🚨 <b>SHADOW VOLUME ALERT</b> 🚨🚨",
         "",
@@ -476,13 +497,14 @@ def build_alert(m, prev_vol, mult, gt_note):
         "🔥 <b>5m volume: $%s</b>  (<b>%.2fx</b> vs previous $%s)" % (fmt_usd(m["vol5m"]), mult, fmt_usd(prev_vol)),
         "💧 Liquidity: $%s" % fmt_usd(m["liquidity"]),
         "🟢 Buys (5m): %d   🔴 Sells (5m): %d   (%.0f%% buys)" % (buys, sells, buy_pct),
-        "💵 Price: %s%s" % (fmt_price(m["price"]),
-                           "  (%+.2f%% 5m)" % to_float(change) if change is not None else ""),
+        "⚖️ Buy/sell ratio: %s  %s" % ("%.2f" % ratio if ratio is not None else ("∞" if buys else "n/a"), pressure),
+        "💵 Price: %s   5m: %s   1h: %s" % (fmt_price(m["price"]), fmt_pct(m["change5m"]), fmt_pct(m["change1h"])),
     ]
     if m["mcap"] >= 1000:
         lines.append("🏦 Market cap: $%s" % fmt_usd(m["mcap"]))
     lines.append("📊 1h volume: $%s   DEX: %s%s" % (fmt_usd(m["vol1h"]), e(m["dex"]),
                                                   ("   Age: %s" % age) if age else ""))
+    lines += safety_lines(safety, m["mint"])
     lines += [
         "✅ Verified: %s" % e(gt_note),
         "",
@@ -497,16 +519,20 @@ def build_alert(m, prev_vol, mult, gt_note):
 
 
 class Telegram:
-    def __init__(self, token, chat_id, dry_run):
+    def __init__(self, token, chat_id, dry_run, session=None):
         self.token = token
         self.chat_id = chat_id
         self.dry_run = dry_run or not token or not chat_id
-        self.session = requests.Session()
+        # Each thread creates its own Telegram object, so sessions are never shared between threads
+        self.session = session or requests.Session()
+
+    def _url(self, method):
+        return "%s/bot%s/%s" % (TELEGRAM, self.token, method)
 
     def check(self):
         """Verify the bot token. Returns username, "" if the token is rejected, None on network error."""
         try:
-            r = self.session.get("%s/bot%s/getMe" % (TELEGRAM, self.token), timeout=20)
+            r = self.session.get(self._url("getMe"), timeout=20)
             data = r.json()
         except (requests.RequestException, ValueError) as exc:
             log.error("Cannot reach Telegram: %s", exc)
@@ -516,48 +542,379 @@ class Telegram:
             return "" if r.status_code in (401, 404) else None
         return data["result"].get("username") or "bot"
 
-    def send(self, text):
+    def call(self, method, payload, timeout=20):
+        """Call a Telegram method once. Returns (http_status, json); status 0 means network error."""
+        try:
+            r = self.session.post(self._url(method), json=payload, timeout=timeout)
+            return r.status_code, r.json()
+        except (requests.RequestException, ValueError) as exc:
+            return 0, {"ok": False, "description": str(exc)}
+
+    def send(self, text, chat_id=None, reply_to=None):
         """Send an HTML message. Returns True on success."""
         if self.dry_run:
             log.info("[DRY-RUN] Telegram message:\n%s", text)
             return True
-        url = "%s/bot%s/sendMessage" % (TELEGRAM, self.token)
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
+        payload = {"chat_id": chat_id or self.chat_id, "text": text, "parse_mode": "HTML",
                    "disable_web_page_preview": True}
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+            payload["allow_sending_without_reply"] = True
         for attempt in range(1, 6):
-            try:
-                r = self.session.post(url, json=payload, timeout=20)
-                data = r.json()
-            except (requests.RequestException, ValueError) as exc:
-                log.warning("Telegram send error (try %d/5): %s", attempt, exc)
-                time.sleep(5 * attempt)
-                continue
+            status, data = self.call("sendMessage", payload)
             if data.get("ok"):
                 return True
-            if r.status_code == 429:
+            if status == 0:
+                log.warning("Telegram send error (try %d/5): %s", attempt, data.get("description"))
+                time.sleep(5 * attempt)
+                continue
+            if status == 429:
                 wait = int((data.get("parameters") or {}).get("retry_after", 10)) + 1
                 log.warning("Telegram flood limit, waiting %ss", wait)
                 time.sleep(min(wait, 300))
                 continue
-            if r.status_code in (400, 401, 403):
+            if status in (400, 401, 403):
                 log.error("Telegram refused message (%s): %s. Check TELEGRAM_CHAT_ID and that "
-                          "the bot can post there.", r.status_code, data.get("description"))
+                          "the bot can post there.", status, data.get("description"))
                 return False
-            log.warning("Telegram error %s (try %d/5): %s", r.status_code, attempt, data.get("description"))
+            log.warning("Telegram error %s (try %d/5): %s", status, attempt, data.get("description"))
             time.sleep(5 * attempt)
         return False
+
+    def setup_commands(self):
+        """Remove any webhook (it blocks getUpdates) and register the command menu."""
+        status, data = self.call("deleteWebhook", {"drop_pending_updates": False})
+        if not data.get("ok"):
+            log.warning("deleteWebhook failed (%s): %s", status, data.get("description"))
+        commands = [{"command": c, "description": d} for c, d in BOT_COMMANDS]
+        status, data = self.call("setMyCommands", {"commands": commands})
+        if data.get("ok"):
+            log.info("Telegram command menu registered (%d commands)", len(commands))
+        else:
+            log.warning("setMyCommands failed (%s): %s", status, data.get("description"))
+        return bool(data.get("ok"))
+
+
+# ----------------------------------------------------------------------------
+# Telegram commands
+# ----------------------------------------------------------------------------
+BOT_COMMANDS = [
+    ("start", "Welcome and alert rules"),
+    ("status", "Uptime, last scan, alerts today"),
+    ("settings", "Current alert thresholds"),
+    ("last", "Last 5 alerts"),
+    ("pause", "Pause alerts (scanning continues)"),
+    ("resume", "Resume alerts"),
+    ("help", "List of commands"),
+]
+
+# Live counters shared by the scan loop and the command thread (not saved to disk)
+RUNTIME = {"started": time.time(), "scans": 0, "last_scan": 0.0, "last_scan_pools": 0,
+           "next_scan": 0.0, "scanning": False}
+
+
+def fmt_time(ts):
+    if not ts:
+        return "never"
+    zone = time.strftime("%Z", time.localtime(ts))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + (" " + zone if zone else "")
+
+
+def fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return "%dd %dh %dm" % (days, hours, minutes)
+    if hours:
+        return "%dh %dm" % (hours, minutes)
+    if minutes:
+        return "%dm %ds" % (minutes, secs) if secs else "%dm" % minutes
+    return "%ds" % secs
+
+
+def rules_text(cfg):
+    lines = ["• 5m volume ≥ <b>$%s</b>" % fmt_usd(cfg["min_volume"]),
+             "• Liquidity ≥ <b>$%s</b>" % fmt_usd(cfg["min_liquidity"]),
+             "• 5m transactions ≥ <b>%d</b>" % cfg["min_txns"],
+             "• Volume spike ≥ <b>%.2fx</b> vs previous 5m reading" % cfg["multiplier"]]
+    if cfg["min_buy_ratio"] > 0:
+        lines.append("• Buy/sell ratio ≥ <b>%.2f</b>" % cfg["min_buy_ratio"])
+    if cfg["skip_high_risk"]:
+        lines.append("• High-risk tokens (RugCheck) skipped")
+    lines.append("• Scan every <b>%s</b>" % fmt_duration(cfg["interval"]))
+    return "\n".join(lines)
+
+
+def alerts_today(state, now=None):
+    now = now or time.time()
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    return sum(1 for a in state.get("alert_log", [])
+               if time.strftime("%Y-%m-%d", time.localtime(a.get("ts", 0))) == today)
+
+
+def handle_command(text, cfg, state, runtime=None, now=None):
+    """Return the HTML reply for a command, or None if the text is not a command."""
+    runtime = RUNTIME if runtime is None else runtime
+    now = now or time.time()
+    if not text or not text.startswith("/"):
+        return None
+    cmd = text.split()[0][1:].split("@")[0].lower()
+    e = html.escape
+    paused_txt = "PAUSED ⏸" if state.get("paused") else "ACTIVE ▶️"
+    if cmd == "start":
+        return ("👋 <b>SHADOW VOLUME ALERT</b>\n"
+                "I scan trending Solana meme coin pools and alert you when 5-minute volume suddenly jumps. "
+                "Every alert is re-checked on DexScreener, confirmed by GeckoTerminal and safety-checked "
+                "with RugCheck.\n\n<b>Alert rules</b>\n%s\n\nAlerts are <b>%s</b>. Send /help for commands."
+                % (rules_text(cfg), paused_txt))
+    if cmd == "help":
+        return "<b>Commands</b>\n" + "\n".join("/%s - %s" % (c, e(d)) for c, d in BOT_COMMANDS)
+    if cmd == "settings":
+        return ("⚙️ <b>Settings</b>\n%s\n• Min previous 5m volume: $%s\n• Previous reading age: %s to %s\n"
+                "• Cooldown per coin: %s\n• Watchlist: %s\n• GeckoTerminal cross-check: %s (tolerance %.0f%%)\n"
+                "• Skip high-risk tokens: %s\n• Min buy/sell ratio: %s\n• Max pools per scan: %d\n\n"
+                "<i>Change these in config.env, then restart the bot.</i>"
+                % (rules_text(cfg), fmt_usd(cfg["min_prev_volume"]), fmt_duration(cfg["min_gap"]),
+                   fmt_duration(cfg["max_gap"]), fmt_duration(cfg["cooldown"]),
+                   fmt_duration(cfg["watch_seconds"]), "on" if cfg["cross_check"] else "off",
+                   cfg["tolerance"] * 100, "yes" if cfg["skip_high_risk"] else "no",
+                   ("%.2f" % cfg["min_buy_ratio"]) if cfg["min_buy_ratio"] > 0 else "off", cfg["max_pools"]))
+    if cmd == "status":
+        alert_log = state.get("alert_log", [])
+        last = alert_log[-1] if alert_log else None
+        if runtime.get("scanning"):
+            next_txt = "scanning now"
+        elif runtime.get("next_scan"):
+            next_txt = "in " + fmt_duration(runtime["next_scan"] - now)
+        else:
+            next_txt = "soon"
+        last_txt = ("%s %.2fx at %s" % (e(last.get("symbol", "?")), last.get("mult", 0), fmt_time(last.get("ts")))
+                    if last else "none yet")
+        return ("📡 <b>Status</b>\n• Alerts: <b>%s</b>\n• Uptime: %s\n• Scans done: %d\n"
+                "• Last scan: %s (%d pools read)\n• Next scan: %s\n• Pools tracked: %d\n"
+                "• Alerts today: %d\n• Last alert: %s"
+                % (paused_txt, fmt_duration(now - runtime.get("started", now)), runtime.get("scans", 0),
+                   fmt_time(runtime.get("last_scan")), runtime.get("last_scan_pools", 0), next_txt,
+                   len(state.get("readings", {})), alerts_today(state, now), last_txt))
+    if cmd == "last":
+        recent = state.get("alert_log", [])[-5:]
+        if not recent:
+            return "No alerts yet."
+        lines = ["🧾 <b>Last %d alerts</b>" % len(recent)]
+        for a in reversed(recent):
+            lines.append('• %s\n  <b>%s</b> ($%s) %.2fx, 5m vol $%s, liq $%s, risk %s - <a href="%s">chart</a>'
+                         % (fmt_time(a.get("ts")), e(a.get("name", "?")), e(a.get("symbol", "?")),
+                            a.get("mult", 0), fmt_usd(a.get("vol5m")), fmt_usd(a.get("liquidity")),
+                            e(a.get("risk") or "n/a"), e(a.get("url", ""), quote=True)))
+        return "\n".join(lines)
+    if cmd in ("pause", "resume"):
+        with STATE_LOCK:
+            was_paused = bool(state.get("paused"))
+            state["paused"] = cmd == "pause"
+        save_state(state)
+        if cmd == "pause":
+            return ("⏸ Alerts were already paused." if was_paused else
+                    "⏸ Alerts <b>paused</b>. Scanning continues so history stays fresh. Send /resume to restart.")
+        return "▶️ Alerts <b>resumed</b>." if was_paused else "▶️ Alerts are already active."
+    return "Unknown command. Send /help for the list."
+
+
+def is_authorized(chat, cfg_chat_id):
+    """Only the configured chat may use commands (numeric id or @channelusername)."""
+    if not chat:
+        return False
+    wanted = str(cfg_chat_id).strip()
+    if str(chat.get("id")) == wanted:
+        return True
+    username = chat.get("username")
+    return bool(username) and wanted.startswith("@") and wanted[1:].lower() == username.lower()
+
+
+def process_updates(tg, updates, cfg, state, started_at):
+    """Handle a list of Telegram updates. Returns the next offset, or None if there were none."""
+    next_offset = None
+    for upd in updates:
+        uid = upd.get("update_id")
+        if isinstance(uid, int):
+            next_offset = max(next_offset or 0, uid + 1)
+        msg = upd.get("message") or upd.get("channel_post")
+        if not msg or not isinstance(msg.get("text"), str) or not msg["text"].startswith("/"):
+            continue
+        chat = msg.get("chat") or {}
+        if not is_authorized(chat, cfg["chat_id"]):
+            log.info("Ignored command from unauthorized chat %s", chat.get("id"))
+            continue
+        if msg.get("date", 0) < started_at - 600:
+            log.info("Ignored old command %r (sent while the bot was off)", msg["text"][:30])
+            continue
+        try:
+            reply = handle_command(msg["text"].strip(), cfg, state)
+        except Exception:
+            log.exception("Command handler error")
+            reply = "⚠️ Sorry, something went wrong with that command."
+        if reply:
+            log.info("Command %s from chat %s", msg["text"].split()[0][:30], chat.get("id"))
+            tg.send(reply, chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+    return next_offset
+
+
+def poll_once(tg, cfg, state, started_at, timeout=25):
+    """One getUpdates long-poll. Returns how many seconds to wait before polling again."""
+    with STATE_LOCK:
+        offset = int(state.get("tg_offset") or 0)
+    payload = {"timeout": timeout, "allowed_updates": ["message", "channel_post"]}
+    if offset:
+        payload["offset"] = offset
+    status, data = tg.call("getUpdates", payload, timeout=timeout + 15)
+    if data.get("ok"):
+        result = data.get("result")
+        new_offset = process_updates(tg, result if isinstance(result, list) else [], cfg, state, started_at)
+        if new_offset:
+            with STATE_LOCK:
+                state["tg_offset"] = new_offset
+            save_state(state)
+        return 0
+    if status == 429:
+        wait = int((data.get("parameters") or {}).get("retry_after", 10)) + 1
+        log.warning("Telegram getUpdates flood limit, waiting %ss", wait)
+        return min(wait, 300)
+    if status == 409:
+        log.warning("getUpdates conflict (%s). Removing webhook; is another copy of the bot running?",
+                    data.get("description"))
+        tg.call("deleteWebhook", {"drop_pending_updates": False})
+        return 30
+    if status in (401, 404):
+        log.error("getUpdates unauthorized: %s", data.get("description"))
+        return 300
+    log.warning("getUpdates failed (%s): %s", status or "network", data.get("description"))
+    return 10
+
+
+def command_listener(cfg, state):
+    """Background thread: answers commands within seconds and never blocks scanning."""
+    tg = Telegram(cfg["token"], cfg["chat_id"], False)
+    started_at = time.time()
+    tg.setup_commands()
+    log.info("Command listener started (send /help in Telegram)")
+    while _running:
+        try:
+            wait = poll_once(tg, cfg, state, started_at)
+        except Exception:
+            log.exception("Command listener error")
+            wait = 10
+        end = time.time() + wait
+        while _running and time.time() < end:
+            time.sleep(min(1.0, end - time.time()))
+
+
+# ----------------------------------------------------------------------------
+# Safety (RugCheck) and buy pressure
+# ----------------------------------------------------------------------------
+def rugcheck_report(http, mint, pair_address=None):
+    """Free RugCheck report -> short safety dict, or None if the API is unavailable."""
+    data = http.get_json("%s/tokens/%s/report" % (RUGCHECK, mint), min_gap=1.5, retries=2)
+    if not isinstance(data, dict) or "risks" not in data:
+        return None
+    token = data.get("token") or {}
+    mint_auth = data.get("mintAuthority", token.get("mintAuthority"))
+    freeze_auth = data.get("freezeAuthority", token.get("freezeAuthority"))
+    risks, seen = [], set()
+    for r in sorted(data.get("risks") or [], key=lambda x: to_float(x.get("score")), reverse=True):
+        name = r.get("name") or "?"
+        if name in seen:
+            continue
+        seen.add(name)
+        risks.append({"name": name, "level": r.get("level") or "", "value": r.get("value") or ""})
+    levels = {r["level"] for r in risks}
+    if data.get("rugged"):
+        level = "RUGGED"
+    elif "danger" in levels or mint_auth or freeze_auth:
+        level = "HIGH"
+    elif "warn" in levels:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+    lp_locked = None
+    for market in data.get("markets") or []:
+        if pair_address and market.get("pubkey") == pair_address:
+            lp_locked = (market.get("lp") or {}).get("lpLockedPct")
+    return {"score": data.get("score_normalised"), "level": level, "mint_authority": mint_auth,
+            "freeze_authority": freeze_auth, "risks": risks, "lp_locked": lp_locked,
+            "holders": data.get("totalHolders")}
+
+
+def is_high_risk(safety):
+    return bool(safety) and safety["level"] in ("HIGH", "RUGGED")
+
+
+def safety_lines(safety, mint):
+    e = html.escape
+    link = '<a href="https://rugcheck.xyz/tokens/%s">RugCheck</a>' % e(mint, quote=True)
+    if not safety:
+        return ["🛡 Safety: unavailable (RugCheck did not answer) | %s" % link]
+    icon = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴", "RUGGED": "☠️"}[safety["level"]]
+    score = safety["score"]
+    lines = ["🛡 Safety: %s <b>%s risk</b>%s | %s" % (icon, safety["level"],
+                                                   " (score %s)" % e(str(score)) if score is not None else "", link),
+             "   Mint authority: %s   Freeze authority: %s" % (
+                 "⚠️ ENABLED" if safety["mint_authority"] else "✅ revoked",
+                 "⚠️ ENABLED" if safety["freeze_authority"] else "✅ revoked")]
+    extra = []
+    if safety["lp_locked"] is not None:
+        extra.append("LP locked (this pool): %.0f%%" % to_float(safety["lp_locked"]))
+    if safety["holders"]:
+        extra.append("Holders: %s" % "{:,}".format(int(to_float(safety["holders"]))))
+    if extra:
+        lines.append("   " + "   ".join(extra))
+    if safety["risks"]:
+        top = ["%s%s" % (r["name"], " (%s)" % r["value"] if r["value"] else "") for r in safety["risks"][:3]]
+        lines.append("   Top risks: %s" % e("; ".join(top)))
+    else:
+        lines.append("   Top risks: none reported")
+    return lines
+
+
+def buy_pressure(buys, sells):
+    """Return (ratio, label). ratio is buys/sells (None if there were no sells)."""
+    if sells <= 0:
+        return (None, "🟢 Strong buy pressure (no sells)") if buys > 0 else (None, "⚪ No trades")
+    ratio = buys / float(sells)
+    if ratio >= 1.5:
+        label = "🟢 Strong buy pressure"
+    elif ratio >= 1.1:
+        label = "🟢 Buy pressure"
+    elif ratio > 1 / 1.1:
+        label = "⚪ Balanced"
+    elif ratio > 1 / 1.5:
+        label = "🔴 Sell pressure"
+    else:
+        label = "🔴 Strong sell pressure"
+    return ratio, label
 
 
 # ----------------------------------------------------------------------------
 # Scan cycle
 # ----------------------------------------------------------------------------
+def record_alert(state, m, mult, now, safety):
+    with STATE_LOCK:
+        state["alerts"]["pair:" + m["pair"]] = now
+        state["alerts"]["mint:" + m["mint"]] = now
+        state["alert_log"].append({"ts": now, "name": m["name"], "symbol": m["symbol"], "mult": round(mult, 2),
+                                   "vol5m": m["vol5m"], "liquidity": m["liquidity"], "pair": m["pair"],
+                                   "url": m["url"], "risk": safety["level"] if safety else "unavailable"})
+        state["alert_log"] = state["alert_log"][-50:]
+
+
 def run_scan(http, tg, state, cfg):
     started = time.time()
     # 1) Discover candidate pools
     gt_pools = gt_trending_pool_addresses(http, cfg["gt_pages"])
     promoted = ds_promoted_token_addresses(http)
     ds_pools = ds_best_pairs_for_tokens(http, promoted, cfg["min_liquidity"])
-    watched = sorted(state["watch"], key=lambda k: state["watch"][k], reverse=True)
+    with STATE_LOCK:
+        watched = sorted(state["watch"], key=lambda k: state["watch"][k], reverse=True)
     candidates = list(dict.fromkeys(gt_pools + ds_pools + watched))[:cfg["max_pools"]]
     log.info("Discovery: %d GeckoTerminal pools, %d DexScreener promoted tokens -> %d pairs, "
              "%d watchlist -> %d unique pools", len(set(gt_pools)), len(promoted), len(ds_pools),
@@ -570,39 +927,43 @@ def run_scan(http, tg, state, cfg):
     pairs = ds_fetch_pairs(http, candidates)
     now = time.time()
     fresh_new = set(gt_pools + ds_pools)
-    for addr in candidates:
-        if addr in fresh_new:
-            state["watch"][addr] = now
-
     hits, near = [], []
     stats = {"scanned": len(pairs), "eligible": 0, "baseline": 0, "alerts": 0}
-    for addr, pair in pairs.items():
-        m = extract_metrics(pair)
-        prev = state["readings"].get(addr)
-        ok, reason, mult = evaluate(m, prev, cfg, now)
-        if m["vol5m"] >= cfg["min_volume"] and m["liquidity"] >= cfg["min_liquidity"]:
-            stats["eligible"] += 1
-            if "baseline" in reason:
-                stats["baseline"] += 1
-        if ok:
-            hits.append((m, to_float(prev.get("vol5m")), mult))
-        elif mult >= 1.5:
-            near.append("%s %.2fx (%s)" % (m["symbol"], mult, reason))
-        state["readings"][addr] = {"ts": now, "vol5m": m["vol5m"]}
-
+    with STATE_LOCK:
+        for addr in candidates:
+            if addr in fresh_new:
+                state["watch"][addr] = now
+        for addr, pair in pairs.items():
+            m = extract_metrics(pair)
+            prev = state["readings"].get(addr)
+            ok, reason, mult = evaluate(m, prev, cfg, now)
+            if m["vol5m"] >= cfg["min_volume"] and m["liquidity"] >= cfg["min_liquidity"]:
+                stats["eligible"] += 1
+                if "baseline" in reason:
+                    stats["baseline"] += 1
+            if ok:
+                hits.append((m, to_float(prev.get("vol5m")), mult))
+            elif mult >= 1.5:
+                near.append("%s %.2fx (%s)" % (m["symbol"], mult, reason))
+            state["readings"][addr] = {"ts": now, "vol5m": m["vol5m"]}
+    RUNTIME["last_scan_pools"] = len(pairs)
     if near:
         log.info("Near misses: %s", "; ".join(near[:10]))
 
-    # 3) Dedup, then verify all hits in batches (fresh DexScreener re-read + GeckoTerminal)
+    # 3) Dedup, then verify hits in batches (fresh DexScreener re-read + GeckoTerminal + RugCheck)
     todo, seen_mints = [], set()
     for m, prev_vol, mult in sorted(hits, key=lambda h: h[2], reverse=True):
-        last = max(state["alerts"].get("pair:" + m["pair"], 0), state["alerts"].get("mint:" + m["mint"], 0))
+        with STATE_LOCK:
+            last = max(state["alerts"].get("pair:" + m["pair"], 0), state["alerts"].get("mint:" + m["mint"], 0))
         if now - last < cfg["cooldown"] or m["mint"] in seen_mints:
             log.info("Duplicate suppressed: %s (%s)", m["symbol"],
                      "alerted %d min ago" % ((now - last) // 60) if last else "same coin, other pool")
             continue
         seen_mints.add(m["mint"])
         todo.append((m, prev_vol))
+    if todo and state.get("paused"):
+        log.info("Alerts paused (/resume to enable): not sending %s", ", ".join(m["symbol"] for m, _ in todo))
+        todo = []
     if todo:
         fresh = ds_fetch_pairs(http, [m["pair"] for m, _ in todo])
         gt = gt_fetch_pools(http, [m["pair"] for m, _ in todo]) if cfg["cross_check"] else {}
@@ -628,15 +989,25 @@ def run_scan(http, tg, state, cfg):
                     log.info("Skip %s: GeckoTerminal does not confirm (%s)", m2["symbol"], note)
                     continue
                 gt_note = "DexScreener + GeckoTerminal (%s)" % note
-            if tg.send(build_alert(m2, prev_vol, mult2, gt_note)):
-                state["alerts"]["pair:" + m2["pair"]] = now
-                state["alerts"]["mint:" + m2["mint"]] = now
+            safety = rugcheck_report(http, m2["mint"], m2["pair"])
+            if safety is None:
+                log.info("RugCheck unavailable for %s, alert will say 'safety: unavailable'", m2["symbol"])
+            elif cfg["skip_high_risk"] and is_high_risk(safety):
+                log.info("Skip %s: RugCheck %s risk (SKIP_HIGH_RISK=true)", m2["symbol"], safety["level"])
+                continue
+            if state.get("paused"):
+                log.info("Alerts paused during scan, %s not sent", m2["symbol"])
+                continue
+            if tg.send(build_alert(m2, prev_vol, mult2, gt_note, safety)):
+                record_alert(state, m2, mult2, now, safety)
                 stats["alerts"] += 1
-                log.info("ALERT sent: %s %.2fx 5m vol $%s", m2["symbol"], mult2, fmt_usd(m2["vol5m"]))
+                log.info("ALERT sent: %s %.2fx 5m vol $%s, risk %s", m2["symbol"], mult2, fmt_usd(m2["vol5m"]),
+                         safety["level"] if safety else "unavailable")
                 save_state(state)
             time.sleep(1)  # stay well under Telegram's per-chat limit
 
-    prune_state(state, cfg, time.time())
+    with STATE_LOCK:
+        prune_state(state, cfg, time.time())
     save_state(state)
     log.info("Scan done in %.0fs: %d pools read, %d pass volume+liquidity, %d new baselines, "
              "%d alerts. Stored readings: %d", time.time() - started, stats["scanned"],
@@ -682,7 +1053,15 @@ def selftest():
         status = "OK " if ok == expect else "FAIL"
         failed += ok != expect
         print("%s %-22s -> %s (%s)" % (status, name, ok, reason))
-    msg = build_alert(extract_metrics(pair(12000)), 4000, 3.0, "selftest")
+    sample_safety = {"score": 1, "level": "LOW", "mint_authority": None, "freeze_authority": None,
+                     "risks": [], "lp_locked": 100, "holders": 1234}
+    msg = build_alert(extract_metrics(pair(12000)), 4000, 3.0, "selftest", sample_safety)
+    assert "Strong buy pressure" in msg and "revoked" in msg
+    assert "Safety: unavailable" in build_alert(extract_metrics(pair(12000)), 4000, 3.0, "selftest", None)
+    assert buy_pressure(30, 10)[1].endswith("Strong buy pressure") and "sell" in buy_pressure(5, 20)[1]
+    ratio_cfg = dict(cfg, min_buy_ratio=1.5)
+    assert evaluate(extract_metrics(pair(12000, buys=20, sells=20)), prev, ratio_cfg, now)[0] is False
+    assert evaluate(extract_metrics(pair(12000, buys=40, sells=10)), prev, ratio_cfg, now)[0] is True
     assert "&lt;Coin&gt;" in msg, "HTML escaping failed"
     gt_ok = {"volume_usd": {"m5": "9000"}, "reserve_in_usd": "21000",
              "transactions": {"m5": {"buys": 25, "sells": 9}}}
@@ -759,24 +1138,35 @@ def main():
         tg.send("🟢 <b>SHADOW VOLUME ALERT</b> is online\n"
                 "Scanning Solana meme pools every %d min.\n"
                 "Rules: 5m volume ≥ $%s, liquidity ≥ $%s, 5m txns ≥ %d, spike ≥ %.1fx vs previous 5m.\n"
-                "First scan builds the baseline; alerts can start after the second scan."
+                "First scan builds the baseline; alerts can start after the second scan.\n"
+                "Send /help for commands.%s"
                 % (cfg["interval"] // 60 or 1, fmt_usd(cfg["min_volume"]), fmt_usd(cfg["min_liquidity"]),
-                   cfg["min_txns"], cfg["multiplier"]))
+                   cfg["min_txns"], cfg["multiplier"],
+                   "\n⏸ Alerts are PAUSED. Send /resume to enable them." if state.get("paused") else ""))
+
+    if state.get("paused"):
+        log.warning("Alerts are PAUSED (send /resume in Telegram to enable them)")
+    if not tg.dry_run and not args.once:
+        threading.Thread(target=command_listener, args=(cfg, state), name="commands", daemon=True).start()
 
     http = Http()
     cycle = 0
+    RUNTIME["started"] = time.time()
     while _running:
         cycle += 1
         start = time.time()
         log.info("----- Scan #%d -----", cycle)
+        RUNTIME["scanning"] = True
         try:
             run_scan(http, tg, state, cfg)
         except Exception:  # keep the bot alive no matter what
             log.exception("Unexpected error during scan; continuing")
             save_state(state)
+        RUNTIME.update(scanning=False, scans=cycle, last_scan=time.time())
         if args.once or (args.cycles and cycle >= args.cycles):
             break
         sleep_for = max(5, cfg["interval"] - (time.time() - start))
+        RUNTIME["next_scan"] = time.time() + sleep_for
         log.info("Next scan in %.0fs", sleep_for)
         end = time.time() + sleep_for
         while _running and time.time() < end:

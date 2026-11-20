@@ -1,0 +1,12 @@
+# personal settings / secrets
+config.env
+# runtime data
+state.json
+state.json.broken
+.state_*.tmp
+*.log
+*.log.*
+bot_output.txt
+nohup.out
+__pycache__/
+*.pyc
