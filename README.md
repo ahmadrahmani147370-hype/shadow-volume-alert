@@ -203,6 +203,7 @@ Save: **Ctrl+O**, **Enter**, **Ctrl+X**. (In Termux the Ctrl key is on the extra
 ### Test it
 
 ```bash
+python shadow_volume_alert.py --check           # doctor: checks token, chat ID, webhook, running copies
 python shadow_volume_alert.py --selftest        # offline logic test, should say SELFTEST PASSED
 python shadow_volume_alert.py --test-telegram   # you should get a test message in Telegram
 python shadow_volume_alert.py --once            # one real scan, shows what it found
@@ -270,6 +271,37 @@ Stop the bot: `bash ~/shadow_volume_alert/stop.sh` (or Ctrl+C if it is running i
 
 ---
 
+## Troubleshooting: the bot does not answer
+
+Run the doctor. It never sends alerts, it only checks things and prints hints in English and Roman Urdu:
+
+```bash
+cd ~/shadow-volume-alert && python shadow_volume_alert.py --check
+```
+
+It shows: Python version, whether `config.env` was found and parsed, whether the token is valid (bot username),
+webhook status, your configured chat ID and whether Telegram knows it, the chat IDs that recently wrote to the
+bot (so you can copy the right one), other running copies of the bot (any folder), API reachability and the last
+log lines.
+
+Common causes and fixes:
+
+| Problem | Fix |
+|---|---|
+| Wrong `TELEGRAM_CHAT_ID` (e.g. the bot's own id, a group id, a username) | Send `/start` to the bot. It now replies with **your** chat ID and the exact line to put in `config.env`. Restart the bot. |
+| Old version still running (e.g. from the zip folder `~/shadow_volume_alert`) | `bash stop.sh` stops every copy in every folder. Then `bash start.sh`. |
+| `git pull` failed, so the old code is still there | Run `git status`. If it complains about local changes: `git stash && git pull` |
+| Token or chat ID still the placeholder, or `config.env` missing | `cp config.example.env config.env && nano config.env` |
+| Phone killed Termux | Acquire wakelock, battery "Unrestricted" (see section 5) |
+
+The bot accepts `config.env` lines with spaces around `=`, quotes, `export ` in front and Windows line endings.
+Values in `config.env` always win over environment variables.
+
+Logs: `shadow_volume_alert.log` (normal log) and `errors.log` (Python crashes). `start.sh` prints both when the
+bot crashes, and tells you where they are.
+
+---
+
 ## 6. Settings
 
 All settings are in `config.env` (see the comments in `config.example.env`). After changing anything,
@@ -306,7 +338,7 @@ It does not contain `config.env` or `state.json`, so your settings and history a
 | `config.example.env` | settings template; copy it to `config.env` |
 | `config.env` | your settings + token (created by you, keep private) |
 | `requirements.txt` | Python library list (`requests`) |
-| `start.sh` / `stop.sh` | start with auto-restart / stop |
+| `start.sh` / `stop.sh` | start with auto-restart (refuses to start a 2nd copy) / stop every copy in any folder |
 | `state.json` | saved volume readings, alert history, watchlist (auto-created) |
 | `shadow_volume_alert.log` | log file (auto-rotated, max ~4 MB) |
 | `tests/test_bot.py` | offline tests: `python -m unittest discover -s tests -v` |

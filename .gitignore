@@ -10,3 +10,6 @@ bot_output.txt
 nohup.out
 __pycache__/
 *.pyc
+.start.pid
+.shadow_volume_alert.lock
+errors.log

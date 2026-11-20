@@ -133,7 +133,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(str(sent[0]["chat_id"]), CHAT_ID)
         self.assertEqual(sent[0]["parse_mode"], "HTML")
-        self.assertEqual(sent[0]["reply_to_message_id"], 410)
+        self.assertEqual(sent[0]["reply_parameters"]["message_id"], 410)
         self.assertEqual(self.state["tg_offset"], 43)
         self.assertEqual(sva.load_state(sva.STATE_FILE)["tg_offset"], 43)
         # next poll must send the stored offset
@@ -141,15 +141,53 @@ class CommandTests(unittest.TestCase):
         polls = [p for m, p in self.session.calls if m == "getUpdates"]
         self.assertEqual(polls[-1]["offset"], 43)
 
-    def test_ignores_other_chats_and_old_commands(self):
+    def test_wrong_chat_gets_own_id_but_no_command(self):
+        sva._last_wrong_reply.clear()
         self.session.respond("getUpdates", 200, {"ok": True, "result": [
-            update(1, "/pause", chat_id="999"),
-            update(2, "/pause", date=time.time() - 3600),
-            update(3, "just text")]})
+            update(1, "/pause", chat_id="999"), update(2, "/start", chat_id="999"), update(3, "hi", chat_id="998")]})
         sva.poll_once(self.tg, self.cfg, self.state, time.time())
-        self.assertEqual(self.session.sent(), [])
+        sent = self.session.sent()
+        self.assertEqual(len(sent), 1)                       # one reply, rate limited per chat
+        self.assertEqual(sent[0]["chat_id"], 999)
+        self.assertIn("<code>999</code>", sent[0]["text"])   # their OWN id
+        self.assertNotIn(CHAT_ID, sent[0]["text"])            # configured id is never revealed
+        self.assertFalse(self.state["paused"])               # command NOT executed
+        self.assertEqual(self.state["tg_offset"], 4)
+        self.assertIn("999", self.state["seen_chats"])
+        self.assertFalse(self.state["seen_chats"]["999"]["authorized"])
+        self.assertIn("998", self.state["seen_chats"])
+
+    def test_old_pause_ignored_but_status_answered(self):
+        self.session.respond("getUpdates", 200, {"ok": True, "result": [
+            update(1, "/pause", date=time.time() - 3600), update(2, "/status", date=time.time() - 3600)]})
+        sva.poll_once(self.tg, self.cfg, self.state, time.time())
         self.assertFalse(self.state["paused"])
-        self.assertEqual(self.state["tg_offset"], 4)  # still acknowledged so they are not re-delivered
+        self.assertEqual(len(self.session.sent()), 1)
+        self.assertIn("Status", self.session.sent()[0]["text"])
+
+    def test_empty_chat_id_setup_mode(self):
+        sva._last_wrong_reply.clear()
+        self.cfg["chat_id"] = ""
+        self.session.respond("getUpdates", 200, {"ok": True, "result": [update(1, "/start", chat_id="4242")]})
+        sva.poll_once(self.tg, self.cfg, self.state, time.time())
+        self.assertIn("TELEGRAM_CHAT_ID=4242", self.session.sent()[0]["text"])
+
+    def test_negative_group_id(self):
+        self.cfg["chat_id"] = "-1001234567890"
+        upd = {"update_id": 9, "message": {"message_id": 1, "date": int(time.time()), "text": "/help@NotsureBot",
+                                           "chat": {"id": -1001234567890, "type": "supergroup", "title": "G"}}}
+        self.session.respond("getUpdates", 200, {"ok": True, "result": [upd]})
+        sva.poll_once(self.tg, self.cfg, self.state, time.time())
+        self.assertIn("Commands", self.session.sent()[0]["text"])
+
+    def test_plain_text_fallback(self):
+        self.session.respond("sendMessage", 400, {"ok": False, "description": "Bad Request: can't parse entities"})
+        self.assertTrue(self.tg.send("<b>x</b> &amp; y"))
+        sent = self.session.sent()
+        self.assertEqual(sent[1]["text"], "x & y")
+        self.assertNotIn("parse_mode", sent[1])
+        self.session.respond("sendMessage", 400, {"ok": False, "description": "Bad Request: chat not found"})
+        self.assertFalse(self.tg.send("hi"))
 
     def test_channel_post_by_username(self):
         self.cfg["chat_id"] = "@mychannel"
@@ -163,8 +201,12 @@ class CommandTests(unittest.TestCase):
         self.session.respond("getUpdates", 429, {"ok": False, "parameters": {"retry_after": 7}})
         self.assertEqual(sva.poll_once(self.tg, self.cfg, self.state, time.time()), 8)
         self.session.respond("getUpdates", 409, {"ok": False, "description": "Conflict: webhook is active"})
-        self.assertEqual(sva.poll_once(self.tg, self.cfg, self.state, time.time()), 30)
+        self.assertEqual(sva.poll_once(self.tg, self.cfg, self.state, time.time()), 15)
         self.assertEqual(self.session.calls[-1][0], "deleteWebhook")
+        self.session.respond("getUpdates", 409, {"ok": False, "description": "Conflict: terminated by other "
+                                                 "getUpdates request"})
+        self.assertEqual(sva.poll_once(self.tg, self.cfg, self.state, time.time()), 15)
+        self.assertEqual(self.session.calls[-1][0], "getUpdates")  # no webhook call for instance conflicts
         self.session.respond("getUpdates", 502, {"ok": False, "description": "Bad Gateway"})
         self.assertEqual(sva.poll_once(self.tg, self.cfg, self.state, time.time()), 10)
 
@@ -192,6 +234,66 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(methods[:2], ["deleteWebhook", "setMyCommands"])
         cmds = self.session.calls[1][1]["commands"]
         self.assertEqual([c["command"] for c in cmds], [c for c, _ in sva.BOT_COMMANDS])
+
+
+class ConfigTests(unittest.TestCase):
+    TOKEN = "8123456789:AAHk3xYourRealTokenHere_abcdefghijklmn"
+
+    def parse(self, text, raw=False):
+        path = os.path.join(tempfile.mkdtemp(), "config.env")
+        with open(path, "wb") as f:
+            f.write(text if raw else text.encode("utf-8"))
+        for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            os.environ.pop(k, None)
+        return sva.load_config(path)
+
+    def test_messy_config(self):
+        text = ("\ufeffexport TELEGRAM_BOT_TOKEN = \"%s\"\r\n"
+                "TELEGRAM_CHAT_ID= ' 123456789 '   # my id\r\n"
+                "MIN_TXNS_5M=20.0\r\n" % self.TOKEN)
+        cfg = self.parse(text)
+        self.assertEqual(cfg["token"], self.TOKEN)
+        self.assertEqual(cfg["chat_id"], "123456789")
+        self.assertEqual(cfg["min_txns"], 20)
+        self.assertEqual(cfg["issues"], [])
+
+    def test_bot_prefix_and_spaces_in_id(self):
+        cfg = self.parse("TELEGRAM_BOT_TOKEN=bot%s\nTELEGRAM_CHAT_ID=-100 123 456\n" % self.TOKEN)
+        self.assertEqual(cfg["token"], self.TOKEN)
+        self.assertEqual(cfg["chat_id"], "-100123456")
+
+    def test_problems_reported(self):
+        cfg = self.parse("TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=8123456789\n" % self.TOKEN)
+        self.assertTrue(any("BOT's own id" in i for i in cfg["issues"]))
+        cfg = self.parse("TELEGRAM_BOT_TOKEN=PUT_YOUR_BOT_TOKEN_HERE\nTELEGRAM_CHAT_ID=PUT_YOUR_CHAT_ID_HERE\n")
+        self.assertEqual(cfg["token"], "")
+        self.assertEqual(cfg["chat_id"], "")
+        self.assertEqual(len([i for i in cfg["issues"] if "placeholder" in i]), 2)
+        cfg = self.parse("TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=ahmed_rahmani\n" % self.TOKEN)
+        self.assertEqual(cfg["chat_id"], "@ahmed_rahmani")
+        self.assertTrue(any("username" in i for i in cfg["issues"]))
+        cfg = self.parse("TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=12345\nTELEGRAM_CHATID=1\n" % self.TOKEN)
+        self.assertTrue(any("Unknown setting" in i for i in cfg["issues"]))
+
+    def test_env_does_not_override_file(self):
+        path = os.path.join(tempfile.mkdtemp(), "config.env")
+        with open(path, "w") as f:
+            f.write("TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_CHAT_ID=555\n" % self.TOKEN)
+        os.environ["TELEGRAM_CHAT_ID"] = "999"
+        try:
+            cfg = sva.load_config(path)
+        finally:
+            os.environ.pop("TELEGRAM_CHAT_ID")
+        self.assertEqual(cfg["chat_id"], "555")
+        self.assertTrue(any("ignored" in i for i in cfg["issues"]))
+
+    def test_lock(self):
+        path = os.path.join(tempfile.mkdtemp(), "x.lock")
+        self.assertTrue(sva.acquire_lock(path))
+        import fcntl
+        with open(path, "a+") as other:
+            with self.assertRaises(OSError):
+                fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class SafetyTests(unittest.TestCase):

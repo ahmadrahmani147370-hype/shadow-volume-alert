@@ -18,6 +18,7 @@ Usage:
     python shadow_volume_alert.py --dry-run    # never send to Telegram, print alerts
     python shadow_volume_alert.py --test-telegram   # send one test message and exit
     python shadow_volume_alert.py --selftest   # offline logic test (no network)
+    python shadow_volume_alert.py --check      # doctor: find setup problems (token, chat id, ...)
 
 Telegram commands: /start /status /settings /last /pause /resume /help
 Alerts include a RugCheck safety check and buy/sell pressure.
@@ -28,6 +29,7 @@ import html
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -37,7 +39,7 @@ from logging.handlers import RotatingFileHandler
 
 import requests
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.env")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
@@ -45,7 +47,7 @@ LOG_FILE = os.path.join(BASE_DIR, "shadow_volume_alert.log")
 
 DEXSCREENER = "https://api.dexscreener.com"
 GECKOTERMINAL = "https://api.geckoterminal.com/api/v2"
-TELEGRAM = "https://api.telegram.org"
+TELEGRAM = os.environ.get("SVA_TELEGRAM_API", "https://api.telegram.org")  # env override only for testing
 RUGCHECK = "https://api.rugcheck.xyz/v1"
 GT_GAP = 6.5  # seconds between GeckoTerminal calls (free tier is strict)
 
@@ -101,40 +103,99 @@ STATE_LOCK = threading.RLock()  # protects the state shared by the scan loop and
 # ----------------------------------------------------------------------------
 # Config / logging / state
 # ----------------------------------------------------------------------------
-def load_config(path=CONFIG_FILE):
-    """Read KEY=VALUE lines from config.env. Environment variables override."""
+def clean_value(value):
+    """Strip whitespace, CR, surrounding quotes and trailing ' # comments' from a config value."""
+    value = value.replace("\r", "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1].strip()
+    # remove an inline comment that starts with whitespace + '#'
+    for sep in (" #", "\t#"):
+        if sep in value:
+            value = value.split(sep, 1)[0].rstrip()
+    return value.strip().strip('"').strip("'").strip()
+
+
+def normalize_chat_id(raw):
+    """'  -100 123 ' -> '-100123'; keeps @channelname. Returns (chat_id, problem_or_None)."""
+    value = clean_value(raw or "").replace(" ", "")
+    if not value or value.upper().startswith(("PUT_", "YOUR_")):
+        return "", "TELEGRAM_CHAT_ID is empty / still the placeholder"
+    if value.startswith("@"):
+        return value, None
+    if re.fullmatch(r"-?\d+", value):
+        return value, None
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", value):
+        return "@" + value, ("TELEGRAM_CHAT_ID=%s looks like a username. Usernames only work for public "
+                             "channels; for your private chat use the NUMBER the bot tells you." % value)
+    return value, "TELEGRAM_CHAT_ID=%r is not a number (example: 123456789 or -1001234567890)" % value
+
+
+def load_config(path=None):
+    """Read KEY=VALUE lines from config.env (tolerates CRLF, BOM, 'export', quotes, spaces).
+    Environment variables override the file."""
+    path = path or CONFIG_FILE
     cfg = dict(DEFAULTS)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+    issues = []
+    file_keys = set()
+    found = os.path.exists(path)
+    if found:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             for raw in f:
-                line = raw.strip()
+                line = raw.replace("\r", "").strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
+                if line.lower().startswith("export "):
+                    line = line[7:].strip()
                 key, value = line.split("=", 1)
-                cfg[key.strip().upper()] = value.strip().strip('"').strip("'")
+                key = key.strip().upper()
+                if key not in DEFAULTS:
+                    issues.append("Unknown setting %r in config.env (typo?)" % key)
+                cfg[key] = clean_value(value)
+                file_keys.add(key)
+    # Environment variables are used only for settings that config.env does not contain
     for key in DEFAULTS:
-        if os.environ.get(key):
-            cfg[key] = os.environ[key]
+        env = os.environ.get(key)
+        if not env:
+            continue
+        if key in file_keys:
+            if clean_value(env) != cfg[key] and key.startswith("TELEGRAM_"):
+                issues.append("Environment variable %s is set but ignored (config.env wins)" % key)
+        else:
+            cfg[key] = clean_value(env)
+            if key.startswith("TELEGRAM_"):
+                issues.append("%s taken from an environment variable (not in config.env)" % key)
 
     def num(key, cast=float):
         try:
-            return cast(cfg[key])
+            return cast(float(cfg[key]))
         except (TypeError, ValueError):
-            log.warning("Bad value for %s=%r, using default %s", key, cfg[key], DEFAULTS[key])
-            return cast(DEFAULTS[key])
+            issues.append("Bad value %s=%r, using default %s" % (key, cfg[key], DEFAULTS[key]))
+            return cast(float(DEFAULTS[key]))
 
     def flag(key):
         return str(cfg[key]).strip().lower() in ("1", "true", "yes", "on")
 
-    token = cfg["TELEGRAM_BOT_TOKEN"].strip()
-    chat_id = cfg["TELEGRAM_CHAT_ID"].strip()
-    if token.upper().startswith("PUT_") or token.upper().startswith("YOUR_"):
+    token = clean_value(cfg["TELEGRAM_BOT_TOKEN"]).replace(" ", "")
+    if token.lower().startswith("bot") and ":" in token:
+        token = token[3:]  # people sometimes paste 'bot123:ABC' from the getUpdates URL
+    if not token or token.upper().startswith(("PUT_", "YOUR_")):
         token = ""
-    if chat_id.upper().startswith("PUT_") or chat_id.upper().startswith("YOUR_"):
-        chat_id = ""
+        issues.append("TELEGRAM_BOT_TOKEN is empty / still the placeholder")
+    elif not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", token):
+        issues.append("TELEGRAM_BOT_TOKEN does not look like a BotFather token (123456789:AA...)")
+    chat_id, chat_problem = normalize_chat_id(cfg["TELEGRAM_CHAT_ID"])
+    if chat_problem:
+        issues.append(chat_problem)
+    bot_id = token.split(":", 1)[0] if token else ""
+    if chat_id and bot_id and chat_id == bot_id:
+        issues.append("TELEGRAM_CHAT_ID is the BOT's own id (first part of the token). Use YOUR chat id.")
     return {
         "token": token,
         "chat_id": chat_id,
+        "bot_id": bot_id,
+        "config_path": path,
+        "config_found": found,
+        "issues": issues,
         "interval": max(60, num("SCAN_INTERVAL_SECONDS", int)),
         "min_volume": num("MIN_VOLUME_5M_USD"),
         "min_liquidity": num("MIN_LIQUIDITY_USD"),
@@ -156,6 +217,63 @@ def load_config(path=CONFIG_FILE):
     }
 
 
+# ----------------------------------------------------------------------------
+# Single instance lock / process detection
+# ----------------------------------------------------------------------------
+LOCK_FILE = os.path.join(BASE_DIR, ".shadow_volume_alert.lock")
+_lock_handle = None
+
+
+def acquire_lock(path=None):
+    """Return True if this is the only running copy in this folder (fcntl lock, released on exit)."""
+    global _lock_handle
+    path = path or LOCK_FILE
+    try:
+        import fcntl
+    except ImportError:  # not Linux/Android: skip
+        return True
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _lock_handle = handle
+    return True
+
+
+def other_bot_processes():
+    """Find other running shadow_volume_alert.py processes (any folder, any version) via /proc."""
+    found = []
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        if int(pid) in (me, os.getppid()):
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except OSError:
+            continue
+        if "shadow_volume_alert.py" not in cmd or "python" not in cmd:
+            continue
+        if any(flag in cmd for flag in ("--check", "--selftest", "--test-telegram", "unittest")):
+            continue
+        try:
+            cwd = os.readlink("/proc/%s/cwd" % pid)
+        except OSError:
+            cwd = "?"
+        found.append({"pid": int(pid), "cmd": cmd, "cwd": cwd})
+    return found
+
+
 def setup_logging():
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
     log.setLevel(logging.INFO)
@@ -172,7 +290,8 @@ def setup_logging():
 
 
 def empty_state():
-    return {"readings": {}, "alerts": {}, "watch": {}, "alert_log": [], "paused": False, "tg_offset": 0}
+    return {"readings": {}, "alerts": {}, "watch": {}, "alert_log": [], "paused": False, "tg_offset": 0,
+            "seen_chats": {}}
 
 
 def load_state(path=None):
@@ -551,21 +670,24 @@ class Telegram:
             return 0, {"ok": False, "description": str(exc)}
 
     def send(self, text, chat_id=None, reply_to=None):
-        """Send an HTML message. Returns True on success."""
+        """Send an HTML message. Falls back to plain text if Telegram rejects the formatting.
+        Returns True on success."""
         if self.dry_run:
             log.info("[DRY-RUN] Telegram message:\n%s", text)
             return True
-        payload = {"chat_id": chat_id or self.chat_id, "text": text, "parse_mode": "HTML",
-                   "disable_web_page_preview": True}
+        target = chat_id if chat_id is not None else self.chat_id
+        payload = {"chat_id": target, "text": text, "parse_mode": "HTML",
+                   "link_preview_options": {"is_disabled": True}}
         if reply_to:
-            payload["reply_to_message_id"] = reply_to
-            payload["allow_sending_without_reply"] = True
+            payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        plain_tried = False
         for attempt in range(1, 6):
             status, data = self.call("sendMessage", payload)
             if data.get("ok"):
                 return True
+            desc = str(data.get("description"))
             if status == 0:
-                log.warning("Telegram send error (try %d/5): %s", attempt, data.get("description"))
+                log.warning("Telegram send error (try %d/5): %s", attempt, desc)
                 time.sleep(5 * attempt)
                 continue
             if status == 429:
@@ -573,11 +695,21 @@ class Telegram:
                 log.warning("Telegram flood limit, waiting %ss", wait)
                 time.sleep(min(wait, 300))
                 continue
+            if status == 400 and not plain_tried and "chat not found" not in desc.lower():
+                # e.g. "can't parse entities" or an unsupported option: retry as simple plain text
+                log.warning("Telegram rejected the message (%s), retrying as plain text", desc)
+                plain_tried = True
+                payload = {"chat_id": target, "text": re.sub(r"<[^>]+>", "", text).replace("&lt;", "<")
+                           .replace("&gt;", ">").replace("&quot;", '"').replace("&amp;", "&")}
+                continue
             if status in (400, 401, 403):
-                log.error("Telegram refused message (%s): %s. Check TELEGRAM_CHAT_ID and that "
-                          "the bot can post there.", status, data.get("description"))
+                log.error("Telegram refused message to chat %s (%s): %s", target, status, desc)
+                if "chat not found" in desc.lower() or status == 403:
+                    log.error(">>> TELEGRAM_CHAT_ID looks WRONG or you never pressed Start in the bot. "
+                              "Open your bot in Telegram, send /start, and the bot will reply with your "
+                              "real chat ID. Or run: python shadow_volume_alert.py --check")
                 return False
-            log.warning("Telegram error %s (try %d/5): %s", status, attempt, data.get("description"))
+            log.warning("Telegram error %s (try %d/5): %s", status, attempt, desc)
             time.sleep(5 * attempt)
         return False
 
@@ -610,7 +742,7 @@ BOT_COMMANDS = [
 
 # Live counters shared by the scan loop and the command thread (not saved to disk)
 RUNTIME = {"started": time.time(), "scans": 0, "last_scan": 0.0, "last_scan_pools": 0,
-           "next_scan": 0.0, "scanning": False}
+           "next_scan": 0.0, "scanning": False, "last_poll": 0.0, "poll_ok": 0.0, "conflicts": 0}
 
 
 def fmt_time(ts):
@@ -722,14 +854,51 @@ def handle_command(text, cfg, state, runtime=None, now=None):
 
 
 def is_authorized(chat, cfg_chat_id):
-    """Only the configured chat may use commands (numeric id or @channelusername)."""
-    if not chat:
+    """Only the configured chat may use commands (numeric id or @username)."""
+    if not chat or not cfg_chat_id:
         return False
     wanted = str(cfg_chat_id).strip()
-    if str(chat.get("id")) == wanted:
+    if str(chat.get("id")).strip() == wanted:
         return True
     username = chat.get("username")
-    return bool(username) and wanted.startswith("@") and wanted[1:].lower() == username.lower()
+    return bool(username) and wanted.startswith("@") and wanted[1:].lower() == str(username).lower()
+
+
+def chat_label(chat):
+    name = chat.get("title") or " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x)
+    if chat.get("username"):
+        name = (name + " @" + chat["username"]).strip()
+    return name or "?"
+
+
+def remember_chat(state, chat, text, authorized):
+    """Keep the last few chats that wrote to the bot (shown by --check)."""
+    with STATE_LOCK:
+        seen = state.setdefault("seen_chats", {})
+        seen[str(chat.get("id"))] = {"type": chat.get("type", "?"), "name": chat_label(chat),
+                                     "text": (text or "")[:30], "ts": time.time(), "authorized": authorized}
+        if len(seen) > 10:
+            for key in sorted(seen, key=lambda k: seen[k]["ts"])[:-10]:
+                del seen[key]
+
+
+def wrong_chat_reply(chat):
+    cid = chat.get("id")
+    kind = chat.get("type", "private")
+    where = {"private": "your private chat with me", "group": "this group",
+             "supergroup": "this group", "channel": "this channel"}.get(kind, "this chat")
+    return ("⚠️ <b>SHADOW VOLUME ALERT is not set up for this chat.</b>\n\n"
+            "The chat ID of %s is:\n<code>%s</code>\n\n"
+            "If you own this bot, put this line in <b>config.env</b> on your phone and restart the bot:\n"
+            "<code>TELEGRAM_CHAT_ID=%s</code>\n\n"
+            "Termux:\n<code>cd ~/shadow-volume-alert &amp;&amp; bash stop.sh &amp;&amp; nano config.env</code>\n"
+            "(use your own bot folder if it is different)\n"
+            "then <code>bash start.sh</code>\n\n"
+            "<i>Roman Urdu: config.env mein TELEGRAM_CHAT_ID=%s likhein, save karein (Ctrl+O, Enter, Ctrl+X) "
+            "aur bot dobara start karein.</i>" % (where, cid, cid, cid))
+
+
+_last_wrong_reply = {}
 
 
 def process_updates(tg, updates, cfg, state, started_at):
@@ -740,23 +909,42 @@ def process_updates(tg, updates, cfg, state, started_at):
         if isinstance(uid, int):
             next_offset = max(next_offset or 0, uid + 1)
         msg = upd.get("message") or upd.get("channel_post")
-        if not msg or not isinstance(msg.get("text"), str) or not msg["text"].startswith("/"):
+        if not isinstance(msg, dict) or not isinstance(msg.get("text"), str):
             continue
+        text = msg["text"].strip()
         chat = msg.get("chat") or {}
-        if not is_authorized(chat, cfg["chat_id"]):
-            log.info("Ignored command from unauthorized chat %s", chat.get("id"))
+        authorized = is_authorized(chat, cfg["chat_id"])
+        remember_chat(state, chat, text, authorized)
+        if not text.startswith("/"):
+            if not authorized:
+                log.warning("Message from chat %s (%s) which is not TELEGRAM_CHAT_ID=%s", chat.get("id"),
+                            chat_label(chat), cfg["chat_id"] or "(empty)")
             continue
-        if msg.get("date", 0) < started_at - 600:
-            log.info("Ignored old command %r (sent while the bot was off)", msg["text"][:30])
+        if not authorized:
+            log.warning(">>> Command %r from chat %s (%s, %s) IGNORED: TELEGRAM_CHAT_ID in config.env is %s. "
+                        "If this is you, set TELEGRAM_CHAT_ID=%s and restart.", text[:20], chat.get("id"),
+                        chat.get("type"), chat_label(chat), cfg["chat_id"] or "(empty)", chat.get("id"))
+            # Tell the sender their OWN chat id (never the configured one); max once per 10 min per chat
+            key = str(chat.get("id"))
+            if time.time() - _last_wrong_reply.get(key, 0) > 600:
+                _last_wrong_reply[key] = time.time()
+                tg.send(wrong_chat_reply(chat), chat_id=chat.get("id"))
+            continue
+        cmd = text.split()[0][1:].split("@")[0].lower()
+        # Do not replay an old /pause or /resume that was sent while the bot was off.
+        # (Telegram dates and time.time() are both UTC epoch seconds; phone time zone does not matter.)
+        if cmd in ("pause", "resume") and msg.get("date", 0) < started_at - 600:
+            log.info("Ignored old /%s sent while the bot was off", cmd)
             continue
         try:
-            reply = handle_command(msg["text"].strip(), cfg, state)
+            reply = handle_command(text, cfg, state)
         except Exception:
             log.exception("Command handler error")
             reply = "⚠️ Sorry, something went wrong with that command."
         if reply:
-            log.info("Command %s from chat %s", msg["text"].split()[0][:30], chat.get("id"))
-            tg.send(reply, chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+            log.info("Command %s from chat %s", text.split()[0][:30], chat.get("id"))
+            if not tg.send(reply, chat_id=chat.get("id"), reply_to=msg.get("message_id")):
+                log.error("Could not reply to %s in chat %s", text.split()[0][:30], chat.get("id"))
     return next_offset
 
 
@@ -768,7 +956,9 @@ def poll_once(tg, cfg, state, started_at, timeout=25):
     if offset:
         payload["offset"] = offset
     status, data = tg.call("getUpdates", payload, timeout=timeout + 15)
+    RUNTIME["last_poll"] = time.time()
     if data.get("ok"):
+        RUNTIME["poll_ok"] = time.time()
         result = data.get("result")
         new_offset = process_updates(tg, result if isinstance(result, list) else [], cfg, state, started_at)
         if new_offset:
@@ -776,28 +966,41 @@ def poll_once(tg, cfg, state, started_at, timeout=25):
                 state["tg_offset"] = new_offset
             save_state(state)
         return 0
+    desc = data.get("description")
     if status == 429:
         wait = int((data.get("parameters") or {}).get("retry_after", 10)) + 1
         log.warning("Telegram getUpdates flood limit, waiting %ss", wait)
         return min(wait, 300)
     if status == 409:
-        log.warning("getUpdates conflict (%s). Removing webhook; is another copy of the bot running?",
-                    data.get("description"))
-        tg.call("deleteWebhook", {"drop_pending_updates": False})
-        return 30
+        RUNTIME["conflicts"] = RUNTIME.get("conflicts", 0) + 1
+        log.error(">>> getUpdates CONFLICT (%s). Another copy of this bot (same token) is running somewhere "
+                  "(another Termux session/folder, another phone or PC). Stop it: bash stop.sh", desc)
+        if "webhook" in str(desc).lower():
+            tg.call("deleteWebhook", {"drop_pending_updates": False})
+        return 15
     if status in (401, 404):
-        log.error("getUpdates unauthorized: %s", data.get("description"))
+        log.error("getUpdates unauthorized: %s (check TELEGRAM_BOT_TOKEN)", desc)
         return 300
-    log.warning("getUpdates failed (%s): %s", status or "network", data.get("description"))
+    if status == 400 and offset:
+        log.warning("getUpdates rejected offset %s (%s); resetting it", offset, desc)
+        with STATE_LOCK:
+            state["tg_offset"] = 0
+        return 2
+    log.warning("getUpdates failed (%s): %s", status or "network", desc)
     return 10
 
 
 def command_listener(cfg, state):
-    """Background thread: answers commands within seconds and never blocks scanning."""
+    """Background thread: answers commands within seconds and never blocks scanning.
+    Any error is logged and the loop continues; main() restarts the thread if it ever dies."""
     tg = Telegram(cfg["token"], cfg["chat_id"], False)
-    started_at = time.time()
-    tg.setup_commands()
-    log.info("Command listener started (send /help in Telegram)")
+    started_at = RUNTIME.get("started") or time.time()
+    try:
+        tg.setup_commands()
+    except Exception:
+        log.exception("setup_commands failed (continuing)")
+    log.info("Command listener running. Commands are accepted only from chat %s. Send /start to the bot.",
+             cfg["chat_id"] or "(none configured: the bot will tell people their chat ID)")
     while _running:
         try:
             wait = poll_once(tg, cfg, state, started_at)
@@ -807,6 +1010,12 @@ def command_listener(cfg, state):
         end = time.time() + wait
         while _running and time.time() < end:
             time.sleep(min(1.0, end - time.time()))
+
+
+def start_listener(cfg, state):
+    t = threading.Thread(target=command_listener, args=(cfg, state), name="commands", daemon=True)
+    t.start()
+    return t
 
 
 # ----------------------------------------------------------------------------
@@ -1086,6 +1295,173 @@ def _stop(signum, _frame):
     log.info("Signal %s received, stopping after current step...", signum)
 
 
+def _thread_excepthook(args):
+    log.error("Thread %s crashed: %s", getattr(args.thread, "name", "?"), args.exc_value,
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def mask_token(token):
+    return token[:6] + "..." + token[-4:] if len(token) > 12 else ("(empty)" if not token else "***")
+
+
+def doctor():
+    """--check: print a step-by-step health report with English + Roman Urdu hints. Never sends alerts."""
+    ok_all = True
+
+    def line(status, msg, hint=None):
+        nonlocal ok_all
+        icon = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]", "info": "[INFO]"}[status]
+        if status == "fail":
+            ok_all = False
+        print("%s %s" % (icon, msg))
+        if hint:
+            for h in hint if isinstance(hint, list) else [hint]:
+                print("       -> " + h)
+
+    print("=" * 64)
+    print(" SHADOW VOLUME ALERT v%s  --check (doctor)" % VERSION)
+    print("=" * 64)
+    line("info", "Python %s at %s" % (sys.version.split()[0], sys.executable))
+    line("info", "requests %s" % requests.__version__)
+    line("info", "Bot folder: %s" % BASE_DIR)
+    line("info", "Local time: %s (UTC epoch %d)" % (fmt_time(time.time()), int(time.time())))
+
+    cfg = load_config()
+    if cfg["config_found"]:
+        line("ok", "config.env found: %s" % cfg["config_path"])
+    else:
+        line("fail", "config.env NOT found in %s" % BASE_DIR,
+             ["cp config.example.env config.env && nano config.env",
+              "Roman Urdu: pehle config.example.env ko config.env naam se copy karein, phir token aur chat id likhein."])
+    for issue in cfg["issues"]:
+        line("warn", issue)
+
+    others = other_bot_processes()
+    if others:
+        for p in others:
+            line("info" if p["cwd"] == BASE_DIR else "warn",
+                 "Bot already running: pid %d in %s :: %s" % (p["pid"], p["cwd"], p["cmd"][:80]))
+        if len({p["cwd"] for p in others}) > 1 or any(p["cwd"] != BASE_DIR for p in others):
+            line("warn", "A copy is running from ANOTHER folder (old version?). Two copies fight over Telegram.",
+                 ["bash stop.sh   (stops every copy, in any folder)",
+                  "Roman Urdu: purani copy chal rahi hai. 'bash stop.sh' chala kar sab band karein, phir 'bash start.sh'."])
+    else:
+        line("info", "No running copy of the bot found (start it with: bash start.sh)")
+
+    token = cfg["token"]
+    if not token:
+        line("fail", "No bot token. Put TELEGRAM_BOT_TOKEN=... (from @BotFather) in config.env",
+             "Roman Urdu: config.env mein BotFather wala token likhein.")
+        return finish_doctor(ok_all)
+    tg = Telegram(token, cfg["chat_id"], False)
+    try:
+        r = tg.session.get(tg._url("getMe"), timeout=20)
+        me = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        line("fail", "Cannot reach api.telegram.org: %s" % exc,
+             ["Check internet / VPN / DNS. Roman Urdu: internet check karein."])
+        return finish_doctor(ok_all)
+    if not me.get("ok"):
+        line("fail", "Token REJECTED by Telegram (%s). Token used: %s" % (me.get("description"), mask_token(token)),
+             ["Copy the token again from @BotFather (/mybots -> your bot -> API Token).",
+              "Roman Urdu: token galat hai. BotFather se dobara copy karein, bilkul poora."])
+        return finish_doctor(ok_all)
+    bot = me["result"]
+    line("ok", "Token valid: bot @%s (id %s, name %r)" % (bot.get("username"), bot.get("id"), bot.get("first_name")))
+    line("info", "Open https://t.me/%s and press START / send /start" % bot.get("username"))
+
+    status, wh = tg.call("getWebhookInfo", {})
+    url = (wh.get("result") or {}).get("url") if wh.get("ok") else None
+    if url:
+        line("warn", "A webhook is set (%s). The bot removes it automatically when it starts." % url)
+    else:
+        line("ok", "No webhook set")
+
+    chat_id = cfg["chat_id"]
+    if not chat_id:
+        line("fail", "TELEGRAM_CHAT_ID is empty",
+             ["Send /start to @%s; the running bot replies with your chat ID." % bot.get("username"),
+              "Roman Urdu: bot ko /start bhejein, woh aapka chat ID bata dega."])
+    else:
+        line("info", "Configured TELEGRAM_CHAT_ID=%s" % chat_id)
+        status, info = tg.call("getChat", {"chat_id": chat_id})
+        if info.get("ok"):
+            c = info["result"]
+            line("ok", "Chat %s exists: %s (%s)" % (c.get("id"), chat_label(c), c.get("type")))
+        else:
+            line("fail", "Telegram cannot find chat %s: %s" % (chat_id, info.get("description")),
+                 ["Usually: wrong number, or you never pressed START in the bot, or the bot is not in that group.",
+                  "Send /start to @%s; it replies with your real chat ID." % bot.get("username"),
+                  "Roman Urdu: chat id galat hai ya aap ne bot mein START nahi dabaya."])
+
+    # Recent chats: from the running bot's state.json, or from getUpdates if the bot is not running
+    state = load_state()
+    seen = state.get("seen_chats") or {}
+    recent = {}
+    for cid, info in seen.items():
+        recent[cid] = info
+    if not others:
+        status, upd = tg.call("getUpdates", {"timeout": 0, "limit": 50})
+        if upd.get("ok"):
+            for u in upd.get("result") or []:
+                m = u.get("message") or u.get("channel_post") or u.get("my_chat_member") or {}
+                c = m.get("chat") or {}
+                if c.get("id") is not None:
+                    recent[str(c["id"])] = {"type": c.get("type"), "name": chat_label(c),
+                                            "text": (m.get("text") or "")[:30], "ts": m.get("date", 0)}
+        elif status == 409 and "webhook" in str(upd.get("description")).lower():
+            line("info", "Recent chats can't be listed while the webhook is set (it is removed when the bot starts).")
+        elif status == 409:
+            line("warn", "getUpdates conflict: another copy is polling with this token (maybe on another device).")
+    if recent:
+        line("info", "Chats that recently wrote to the bot:")
+        for cid, info in sorted(recent.items(), key=lambda kv: -to_float(kv[1].get("ts"))):
+            mark = "  <== matches config" if is_authorized({"id": cid, "username": None}, chat_id) else ""
+            print("         chat id %-16s %-10s %-28s %r%s" % (cid, info.get("type"), info.get("name", "")[:28],
+                                                              info.get("text", ""), mark))
+        if chat_id and not any(is_authorized({"id": cid}, chat_id) for cid in recent):
+            privates = [cid for cid, i in recent.items() if i.get("type") == "private"]
+            line("fail", "None of these chats matches TELEGRAM_CHAT_ID=%s" % chat_id,
+                 ["Put the right number in config.env, e.g. TELEGRAM_CHAT_ID=%s" % (privates[0] if privates else
+                                                                                   list(recent)[0]),
+                  "Roman Urdu: upar wali list se apna chat id config.env mein likhein, phir bot restart karein."])
+    else:
+        line("info", "No recent messages seen. Send /start to @%s, then run --check again." % bot.get("username"))
+
+    # Data APIs
+    for name, url in (("DexScreener", DEXSCREENER + "/token-boosts/latest/v1"),
+                      ("GeckoTerminal", GECKOTERMINAL + "/networks/solana/trending_pools?page=1"),
+                      ("RugCheck", RUGCHECK + "/stats/recent")):
+        try:
+            r = requests.get(url, timeout=15, headers={"Accept": "application/json"})
+            line("ok" if r.status_code == 200 else "warn", "%s API: HTTP %s" % (name, r.status_code))
+        except requests.RequestException as exc:
+            line("warn", "%s API unreachable: %s" % (name, exc))
+
+    if os.path.exists(LOG_FILE):
+        line("info", "Log file: %s  (view: tail -n 50 %s)" % (LOG_FILE, LOG_FILE))
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-8:]
+            print("       last log lines:")
+            for t in tail:
+                print("         " + t.rstrip()[:150])
+        except OSError:
+            pass
+    return finish_doctor(ok_all)
+
+
+def finish_doctor(ok_all):
+    print("-" * 64)
+    if ok_all:
+        print("RESULT: no blocking problem found. Start with: bash start.sh  then send /start to the bot.")
+        print("Roman Urdu: sab theek hai. 'bash start.sh' chalayein aur bot ko /start bhejein.")
+    else:
+        print("RESULT: fix the [FAIL] lines above, then run: bash start.sh")
+        print("Roman Urdu: upar [FAIL] wali cheezein theek karein, phir 'bash start.sh' chalayein.")
+    return 0 if ok_all else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="SHADOW VOLUME ALERT - Solana meme coin volume spike bot")
     parser.add_argument("--once", action="store_true", help="run one scan and exit")
@@ -1094,22 +1470,45 @@ def main():
     parser.add_argument("--cycles", type=int, default=0, help="stop after N scans (testing)")
     parser.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     parser.add_argument("--selftest", action="store_true", help="offline logic test")
+    parser.add_argument("--check", "--doctor", action="store_true", help="diagnose setup problems")
+    parser.add_argument("--version", action="store_true", help="print version")
     args = parser.parse_args()
 
+    if args.version:
+        print("SHADOW VOLUME ALERT v%s" % VERSION)
+        return 0
     if args.selftest:
         return selftest()
+    if args.check:
+        return doctor()
 
     setup_logging()
+    threading.excepthook = _thread_excepthook
     cfg = load_config()
     if args.interval:
         cfg["interval"] = max(10, args.interval)
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    log.info("SHADOW VOLUME ALERT v%s starting", VERSION)
+    log.info("SHADOW VOLUME ALERT v%s starting (Python %s, pid %d, folder %s)", VERSION,
+             sys.version.split()[0], os.getpid(), BASE_DIR)
+    if not cfg["config_found"]:
+        log.warning("config.env not found at %s (copy config.example.env to config.env)", cfg["config_path"])
+    for issue in cfg["issues"]:
+        log.warning("CONFIG: %s", issue)
+
+    if not args.test_telegram and not args.once:
+        if not acquire_lock():
+            log.error("Another copy of the bot is already running in this folder. Stop it first: bash stop.sh")
+            return 3
+        for p in other_bot_processes():
+            log.warning(">>> Another bot process is running: pid %d in %s (%s). Two copies fight over Telegram "
+                        "commands. Run: bash stop.sh, then bash start.sh", p["pid"], p["cwd"], p["cmd"][:60])
+
     tg = Telegram(cfg["token"], cfg["chat_id"], args.dry_run)
-    if tg.dry_run:
-        log.warning("DRY-RUN mode: alerts are printed here, nothing is sent to Telegram "
+    listen = False
+    if not cfg["token"] or args.dry_run:
+        log.warning("DRY-RUN mode: alerts are printed here, nothing is sent to Telegram, commands are OFF "
                     "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in config.env to go live).")
     else:
         username = tg.check()
@@ -1120,7 +1519,11 @@ def main():
         if not username:
             log.error("Fix TELEGRAM_BOT_TOKEN in config.env. Exiting.")
             return 2
-        log.info("Telegram bot @%s ready, chat id %s", username, cfg["chat_id"])
+        listen = True
+        if tg.dry_run:
+            log.error(">>> TELEGRAM_CHAT_ID is missing/invalid, so alerts are NOT sent. Send /start to @%s: "
+                      "it will reply with your chat ID. Put it in config.env and restart.", username)
+        log.info("Telegram bot @%s ready, chat id %s", username, cfg["chat_id"] or "(none)")
 
     if args.test_telegram:
         ok = tg.send("✅ <b>SHADOW VOLUME ALERT</b> test message. Your bot token and chat ID work!")
@@ -1133,25 +1536,25 @@ def main():
     log.info("Rules: 5m vol >= $%s, liquidity >= $%s, 5m txns >= %d, increase >= %.2fx, every %ds",
              fmt_usd(cfg["min_volume"]), fmt_usd(cfg["min_liquidity"]), cfg["min_txns"],
              cfg["multiplier"], cfg["interval"])
-
-    if cfg["startup_msg"] and not args.once:
-        tg.send("🟢 <b>SHADOW VOLUME ALERT</b> is online\n"
-                "Scanning Solana meme pools every %d min.\n"
-                "Rules: 5m volume ≥ $%s, liquidity ≥ $%s, 5m txns ≥ %d, spike ≥ %.1fx vs previous 5m.\n"
-                "First scan builds the baseline; alerts can start after the second scan.\n"
-                "Send /help for commands.%s"
-                % (cfg["interval"] // 60 or 1, fmt_usd(cfg["min_volume"]), fmt_usd(cfg["min_liquidity"]),
-                   cfg["min_txns"], cfg["multiplier"],
-                   "\n⏸ Alerts are PAUSED. Send /resume to enable them." if state.get("paused") else ""))
-
     if state.get("paused"):
         log.warning("Alerts are PAUSED (send /resume in Telegram to enable them)")
-    if not tg.dry_run and not args.once:
-        threading.Thread(target=command_listener, args=(cfg, state), name="commands", daemon=True).start()
+
+    RUNTIME["started"] = time.time()
+    if cfg["startup_msg"] and not args.once and not tg.dry_run:
+        if not tg.send("🟢 <b>SHADOW VOLUME ALERT</b> v%s is online\n"
+                       "Scanning Solana meme pools every %d min.\n"
+                       "Rules: 5m volume ≥ $%s, liquidity ≥ $%s, 5m txns ≥ %d, spike ≥ %.1fx vs previous 5m.\n"
+                       "First scan builds the baseline; alerts can start after the second scan.\n"
+                       "Send /help for commands.%s"
+                       % (VERSION, cfg["interval"] // 60 or 1, fmt_usd(cfg["min_volume"]),
+                          fmt_usd(cfg["min_liquidity"]), cfg["min_txns"], cfg["multiplier"],
+                          "\n⏸ Alerts are PAUSED. Send /resume to enable them." if state.get("paused") else "")):
+            log.error(">>> Startup message could NOT be delivered to TELEGRAM_CHAT_ID=%s", cfg["chat_id"])
+
+    listener = start_listener(cfg, state) if listen and not args.once else None
 
     http = Http()
     cycle = 0
-    RUNTIME["started"] = time.time()
     while _running:
         cycle += 1
         start = time.time()
@@ -1163,6 +1566,12 @@ def main():
             log.exception("Unexpected error during scan; continuing")
             save_state(state)
         RUNTIME.update(scanning=False, scans=cycle, last_scan=time.time())
+        if listener is not None and not listener.is_alive() and _running:
+            log.error("Command listener thread had stopped; restarting it")
+            listener = start_listener(cfg, state)
+        if listener is not None and RUNTIME.get("last_poll") and time.time() - RUNTIME.get("poll_ok", 0) > 600:
+            log.warning("Telegram commands: no successful getUpdates for %d min (internet? conflict?)",
+                        (time.time() - RUNTIME.get("poll_ok", RUNTIME["started"])) // 60)
         if args.once or (args.cycles and cycle >= args.cycles):
             break
         sleep_for = max(5, cfg["interval"] - (time.time() - start))
